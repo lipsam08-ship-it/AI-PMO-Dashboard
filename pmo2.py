@@ -4,6 +4,15 @@ import plotly.graph_objects as go
 from datetime import datetime, date
 import io
 
+# 🔥 NEW ML IMPORTS
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.model_selection import train_test_split
+import warnings
+warnings.filterwarnings('ignore')
+
 # Set page configuration
 st.set_page_config(
     page_title="PMO Dashboard",
@@ -126,6 +135,47 @@ st.markdown("""
         margin: 1rem 0;
         border: 1px solid #ffeaa7;
     }
+    .ml-insight-card {
+        background-color: #e8f4fd;
+        border-radius: 10px;
+        padding: 1.5rem;
+        margin: 1rem 0;
+        border-left: 5px solid #2196F3;
+        box-shadow: 0 2px 8px rgba(33, 150, 243, 0.1);
+    }
+    .ml-risk-high {
+        color: #d32f2f;
+        font-weight: bold;
+        background-color: #ffebee;
+        padding: 2px 8px;
+        border-radius: 12px;
+        display: inline-block;
+    }
+    .ml-risk-medium {
+        color: #f57c00;
+        font-weight: bold;
+        background-color: #fff3e0;
+        padding: 2px 8px;
+        border-radius: 12px;
+        display: inline-block;
+    }
+    .ml-risk-low {
+        color: #388e3c;
+        font-weight: bold;
+        background-color: #e8f5e9;
+        padding: 2px 8px;
+        border-radius: 12px;
+        display: inline-block;
+    }
+    .confidence-high {
+        color: #388e3c;
+    }
+    .confidence-medium {
+        color: #f57c00;
+    }
+    .confidence-low {
+        color: #d32f2f;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -138,8 +188,295 @@ if 'df_uploaded' not in st.session_state:
     st.session_state.df_uploaded = None
 if 'data_warnings' not in st.session_state:
     st.session_state.data_warnings = []
+if 'ml_models' not in st.session_state:  # NEW: Store ML models
+    st.session_state.ml_models = {}
 
-# Helper functions
+# 🔥 NEW ML HELPER FUNCTIONS
+
+def prepare_ml_features(projects):
+    """Prepare features for ML models"""
+    features = []
+    project_names = []
+    
+    for project in projects:
+        # Feature engineering
+        spent_ratio = project['spent'] / project['budget'] if project['budget'] > 0 else 0
+        progress_ratio = project['progress'] / 100
+        efficiency = progress_ratio / spent_ratio if spent_ratio > 0 else 0
+        
+        # Convert status to numerical
+        status_map = {'Planning': 0, 'Active': 1, 'At Risk': 2, 'Critical': 3, 'Completed': 4}
+        status_num = status_map.get(project['status'], 0)
+        
+        # Convert risk level to numerical
+        risk_map = {'Low': 0, 'Medium': 1, 'High': 2, 'Critical': 3}
+        risk_num = risk_map.get(project['risk_level'], 1)
+        
+        # Calculate days if dates are available
+        try:
+            start_date = datetime.strptime(project['start_date'], '%Y-%m-%d')
+            end_date = datetime.strptime(project['end_date'], '%Y-%m-%d')
+            days_duration = (end_date - start_date).days
+            days_elapsed = (datetime.now() - start_date).days
+            time_ratio = days_elapsed / days_duration if days_duration > 0 else 0
+        except:
+            days_duration = 180  # Default 6 months
+            days_elapsed = 90
+            time_ratio = 0.5
+        
+        # Create feature vector
+        feature_vector = [
+            project['budget'],
+            project['spent'],
+            project['progress'],
+            spent_ratio,
+            progress_ratio,
+            efficiency,
+            status_num,
+            risk_num,
+            days_duration,
+            time_ratio,
+            project['roi'] if project['roi'] is not None else 10
+        ]
+        
+        features.append(feature_vector)
+        project_names.append(project['name'])
+    
+    return np.array(features), project_names
+
+def train_risk_prediction_model(projects):
+    """Train ML model to predict project risk"""
+    if len(projects) < 5:
+        return None
+    
+    X, project_names = prepare_ml_features(projects)
+    
+    # Create target labels based on current risk status
+    y = []
+    for project in projects:
+        if project['status'] in ['Critical', 'At Risk'] or project['risk_level'] in ['High', 'Critical']:
+            y.append(1)  # High risk
+        else:
+            y.append(0)  # Low/Medium risk
+    
+    if len(set(y)) < 2:  # Need both classes
+        return None
+    
+    # Train Random Forest classifier
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X, y)
+    
+    return model
+
+def train_budget_prediction_model(projects):
+    """Train ML model to predict final budget overrun"""
+    if len(projects) < 3:
+        return None
+    
+    X, project_names = prepare_ml_features(projects)
+    
+    # Create target: predicted overspending percentage
+    y = []
+    for project in projects:
+        spent_ratio = project['spent'] / project['budget'] if project['budget'] > 0 else 0
+        progress_ratio = project['progress'] / 100
+        
+        if progress_ratio > 0:
+            # Estimate final cost based on current burn rate
+            estimated_final = project['spent'] / progress_ratio
+            overspend_pct = ((estimated_final - project['budget']) / project['budget']) * 100
+        else:
+            overspend_pct = 0
+        
+        y.append(max(0, overspend_pct))  # Only positive overspending
+    
+    # Train Random Forest regressor
+    model = RandomForestRegressor(n_estimators=100, random_state=42)
+    model.fit(X, y)
+    
+    return model
+
+def cluster_projects(projects):
+    """Cluster projects into similar groups using K-means"""
+    if len(projects) < 3:
+        return None, None
+    
+    X, project_names = prepare_ml_features(projects)
+    
+    # Standardize features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # Determine optimal number of clusters (max 5 for small datasets)
+    n_clusters = min(5, len(projects))
+    
+    # Apply K-means clustering
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+    cluster_labels = kmeans.fit_predict(X_scaled)
+    
+    return cluster_labels, kmeans
+
+def generate_ml_insights(projects):
+    """Generate ML-powered insights"""
+    insights = []
+    recommendations = []
+    
+    if len(projects) < 3:
+        insights.append("⚠️ **Not enough data** for ML analysis (need at least 3 projects)")
+        return insights, recommendations
+    
+    # Train ML models
+    with st.spinner("🤖 Training ML models..."):
+        risk_model = train_risk_prediction_model(projects)
+        budget_model = train_budget_prediction_model(projects)
+        cluster_labels, kmeans_model = cluster_projects(projects)
+    
+    # ML Insight 1: Risk Prediction
+    if risk_model:
+        X, project_names = prepare_ml_features(projects)
+        risk_predictions = risk_model.predict_proba(X)
+        
+        high_risk_count = 0
+        for i, probs in enumerate(risk_predictions):
+            high_risk_prob = probs[1]  # Probability of being high risk
+            if high_risk_prob > 0.7:
+                high_risk_count += 1
+                project_name = projects[i]['name']
+                
+                # Get feature importance for this project
+                feature_importance = risk_model.feature_importances_
+                top_features_idx = np.argsort(feature_importance)[-3:][::-1]
+                feature_names = ['Budget', 'Spent', 'Progress', 'Spent Ratio', 'Progress Ratio', 
+                                'Efficiency', 'Status', 'Risk Level', 'Duration', 'Time Ratio', 'ROI']
+                
+                risk_factors = []
+                for idx in top_features_idx:
+                    if feature_importance[idx] > 0.1:
+                        risk_factors.append(feature_names[idx])
+                
+                if risk_factors:
+                    insights.append(f"🔴 **{project_name}**: ML predicts **{high_risk_prob:.0%} probability** of high risk. Key factors: {', '.join(risk_factors)}")
+        
+        if high_risk_count > 0:
+            insights.append(f"📊 **ML Risk Assessment**: {high_risk_count} projects identified as high-risk by ML model (70%+ confidence)")
+    
+    # ML Insight 2: Budget Overrun Prediction
+    if budget_model:
+        X, project_names = prepare_ml_features(projects)
+        budget_predictions = budget_model.predict(X)
+        
+        severe_overruns = []
+        for i, pred in enumerate(budget_predictions):
+            if pred > 20:  # More than 20% predicted overrun
+                severe_overruns.append((projects[i]['name'], pred))
+        
+        if severe_overruns:
+            insights.append("💰 **Budget Overrun Predictions**:")
+            for project_name, overrun_pct in severe_overruns[:3]:  # Show top 3
+                insights.append(f"   • {project_name}: Predicted to exceed budget by **{overrun_pct:.1f}%**")
+            
+            if len(severe_overruns) > 3:
+                insights.append(f"   • ... and {len(severe_overruns) - 3} more projects")
+    
+    # ML Insight 3: Project Clustering
+    if cluster_labels is not None and kmeans_model is not None:
+        unique_clusters = np.unique(cluster_labels)
+        cluster_insights = []
+        
+        for cluster_id in unique_clusters:
+            cluster_projects = [projects[i] for i in range(len(projects)) if cluster_labels[i] == cluster_id]
+            if len(cluster_projects) > 1:
+                # Calculate cluster statistics
+                avg_progress = np.mean([p['progress'] for p in cluster_projects])
+                avg_spent_ratio = np.mean([p['spent']/p['budget'] for p in cluster_projects if p['budget'] > 0])
+                avg_roi = np.mean([p['roi'] for p in cluster_projects if p['roi'] is not None])
+                
+                cluster_type = "High Performers" if avg_progress > 70 and (avg_roi > 15 if not np.isnan(avg_roi) else True) else "Needs Attention"
+                cluster_insights.append(f"   • Cluster {cluster_id+1}: {len(cluster_projects)} projects - {cluster_type}")
+        
+        if cluster_insights:
+            insights.append("🎯 **Project Segmentation**:")
+            insights.extend(cluster_insights)
+            
+            # Recommendation based on clusters
+            low_progress_clusters = [i for i in unique_clusters 
+                                   if np.mean([projects[j]['progress'] for j in range(len(projects)) 
+                                             if cluster_labels[j] == i]) < 40]
+            if low_progress_clusters:
+                recommendations.append("Focus resources on low-progress project clusters")
+    
+    # ML Insight 4: Portfolio Efficiency Score
+    if len(projects) >= 5:
+        efficiency_scores = []
+        for project in projects:
+            spent_ratio = project['spent'] / project['budget'] if project['budget'] > 0 else 0
+            progress_ratio = project['progress'] / 100
+            efficiency = progress_ratio / spent_ratio if spent_ratio > 0 else 0
+            efficiency_scores.append(efficiency)
+        
+        avg_efficiency = np.mean(efficiency_scores)
+        if avg_efficiency < 0.8:
+            insights.append(f"⚡ **Portfolio Efficiency**: Overall efficiency score is **{avg_efficiency:.2f}** (below optimal 0.8)")
+            recommendations.append("Review project execution strategies to improve efficiency")
+    
+    # ML Insight 5: Anomaly Detection
+    if len(projects) >= 5:
+        # Simple anomaly detection based on z-score
+        progress_values = [p['progress'] for p in projects]
+        spent_ratios = [p['spent']/p['budget'] for p in projects if p['budget'] > 0]
+        
+        if spent_ratios:
+            avg_spent_ratio = np.mean(spent_ratios)
+            std_spent_ratio = np.std(spent_ratios)
+            
+            anomalies = []
+            for i, project in enumerate(projects):
+                if project['budget'] > 0:
+                    spent_ratio = project['spent'] / project['budget']
+                    if std_spent_ratio > 0 and abs(spent_ratio - avg_spent_ratio) > 2 * std_spent_ratio:
+                        anomalies.append(project['name'])
+            
+            if anomalies:
+                insights.append(f"🚨 **Anomaly Detection**: {len(anomalies)} projects show unusual spending patterns")
+    
+    # Generate ML-based recommendations
+    if not recommendations:
+        if risk_model and budget_model:
+            # Analyze overall portfolio health
+            X_all, _ = prepare_ml_features(projects)
+            
+            if risk_model:
+                risk_scores = risk_model.predict_proba(X_all)[:, 1]
+                avg_risk = np.mean(risk_scores)
+                
+                if avg_risk > 0.6:
+                    recommendations.append("Consider rebalancing portfolio to reduce overall risk exposure")
+                elif avg_risk < 0.3:
+                    recommendations.append("Portfolio is low-risk; consider taking on more ambitious projects")
+            
+            if budget_model:
+                budget_predictions = budget_model.predict(X_all)
+                avg_overrun = np.mean([p for p in budget_predictions if p > 0])
+                
+                if avg_overrun > 15:
+                    recommendations.append("Implement stricter budget controls and regular reviews")
+    
+    # Default recommendation if none generated
+    if not recommendations:
+        recommendations.append("Monitor key projects closely and review progress weekly")
+    
+    return insights, recommendations
+
+def get_ml_confidence_color(confidence):
+    """Get CSS class for confidence level"""
+    if confidence >= 0.8:
+        return "confidence-high"
+    elif confidence >= 0.6:
+        return "confidence-medium"
+    else:
+        return "confidence-low"
+
+# Original helper functions (keep existing)
 def calculate_portfolio_metrics(projects):
     """Calculate portfolio-level metrics from projects"""
     if not projects:
@@ -349,15 +686,15 @@ def show_welcome_page():
         
         This tool helps you:
         - 📈 **Analyze** project portfolio performance
-        - ⚠️ **Identify** at-risk projects automatically
-        - 💰 **Track** budget utilization and ROI
-        - 📊 **Generate** executive reports instantly
+        - ⚠️ **Identify** at-risk projects automatically using **Machine Learning**
+        - 💰 **Predict** budget overruns with ML models
+        - 📊 **Generate** intelligent executive reports
         - 🎯 **Make** data-driven decisions
         
         ### How it Works:
         1. **Upload** your project data (CSV/Excel)
         2. **Analyze** with interactive dashboard
-        3. **Generate** insights and reports
+        3. **Generate** ML-powered insights
         4. **Export** results for stakeholders
         """)
     
@@ -624,59 +961,99 @@ def show_dashboard_tab():
         else:
             st.info("No project data available")
     
-    # AI-Powered Insights
+    # 🔥 ENHANCED: AI-Powered Insights with ML
     st.markdown('<div class="sub-header">🤖 AI-Powered Insights</div>', unsafe_allow_html=True)
     st.markdown('<div class="card">', unsafe_allow_html=True)
     
-    if st.button("🔍 Generate AI Insights", type="primary", key="gen_insights"):
-        st.success("AI Analysis Generated!")
+    # Add ML model selection
+    col1, col2 = st.columns([3, 1])
+    with col1:
+        ml_mode = st.radio(
+            "Select Analysis Mode:",
+            ["🤖 ML-Powered Insights", "📊 Basic Rule-Based"],
+            horizontal=True
+        )
+    
+    with col2:
+        if st.button("🔍 Generate Insights", type="primary", key="gen_insights"):
+            st.session_state.generating_insights = True
+            st.rerun()
+    
+    if st.session_state.get('generating_insights', False):
+        st.session_state.generating_insights = False
         
-        insights = []
+        if ml_mode == "🤖 ML-Powered Insights":
+            st.success("🤖 ML Analysis Generated!")
+            
+            # Generate ML insights
+            ml_insights, ml_recommendations = generate_ml_insights(st.session_state.projects)
+            
+            if ml_insights:
+                st.markdown("### 🔬 ML-Powered Insights")
+                st.markdown('<div class="ml-insight-card">', unsafe_allow_html=True)
+                
+                for insight in ml_insights:
+                    st.markdown(f"• {insight}")
+                
+                st.markdown('</div>', unsafe_allow_html=True)
+                
+                if ml_recommendations:
+                    st.markdown("### 🎯 ML Recommendations")
+                    for i, rec in enumerate(ml_recommendations, 1):
+                        st.markdown(f"{i}. **{rec}**")
+            else:
+                st.info("Not enough data for ML analysis. Using basic insights instead.")
+                ml_mode = "📊 Basic Rule-Based"
         
-        # Risk analysis
-        if metrics['at_risk_projects'] > 0:
-            insights.append(f"⚠️ **Critical Risk**: {metrics['at_risk_projects']} projects are at critical risk")
-        
-        # Budget analysis
-        if metrics['budget_variance'] < -50:
-            insights.append(f"💰 **Budget Issue**: Significant underspending ({metrics['budget_variance']:.1f}% variance)")
-        elif metrics['total_spent'] > metrics['total_budget']:
-            insights.append(f"💰 **Budget Alert**: Total spending exceeds total budget!")
-        
-        # Progress analysis
-        if metrics['completion_rate'] == 0:
-            insights.append("📊 **Progress Concern**: No projects have been completed yet")
-        
-        if metrics['avg_progress'] < 50:
-            insights.append(f"📊 **Progress Issue**: Average project progress is below 50% ({metrics['avg_progress']:.1f}%)")
-        
-        # ROI analysis
-        if metrics['avg_roi'] < 5:
-            insights.append(f"📈 **ROI Concern**: Average ROI is low at {metrics['avg_roi']:.1f}%")
-        
-        # Specific project issues
-        overspent_projects = [p for p in st.session_state.projects if p['spent'] > p['budget']]
-        if overspent_projects:
-            insights.append(f"💸 **Overspending**: {len(overspent_projects)} projects have spent more than their budget")
-        
-        if insights:
-            st.info("### Key Insights:")
-            for insight in insights:
-                st.write(f"• {insight}")
-        else:
-            st.success("✅ All projects are on track!")
-        
-        # Top recommendations
-        st.markdown("### 🎯 Recommendations:")
-        
-        if overspent_projects:
-            st.write("1. **Immediate Action**: Review overspent projects for budget adjustments")
-        
-        if metrics['at_risk_projects'] > 0:
-            st.write("2. **Priority Focus**: Allocate resources to at-risk projects")
-        
-        if metrics['budget_variance'] < -50:
-            st.write("3. **Budget Review**: Investigate why budget utilization is low")
+        if ml_mode == "📊 Basic Rule-Based":
+            st.success("📊 Basic Analysis Generated!")
+            
+            insights = []
+            
+            # Risk analysis
+            if metrics['at_risk_projects'] > 0:
+                insights.append(f"⚠️ **Critical Risk**: {metrics['at_risk_projects']} projects are at critical risk")
+            
+            # Budget analysis
+            if metrics['budget_variance'] < -50:
+                insights.append(f"💰 **Budget Issue**: Significant underspending ({metrics['budget_variance']:.1f}% variance)")
+            elif metrics['total_spent'] > metrics['total_budget']:
+                insights.append(f"💰 **Budget Alert**: Total spending exceeds total budget!")
+            
+            # Progress analysis
+            if metrics['completion_rate'] == 0:
+                insights.append("📊 **Progress Concern**: No projects have been completed yet")
+            
+            if metrics['avg_progress'] < 50:
+                insights.append(f"📊 **Progress Issue**: Average project progress is below 50% ({metrics['avg_progress']:.1f}%)")
+            
+            # ROI analysis
+            if metrics['avg_roi'] < 5:
+                insights.append(f"📈 **ROI Concern**: Average ROI is low at {metrics['avg_roi']:.1f}%")
+            
+            # Specific project issues
+            overspent_projects = [p for p in st.session_state.projects if p['spent'] > p['budget']]
+            if overspent_projects:
+                insights.append(f"💸 **Overspending**: {len(overspent_projects)} projects have spent more than their budget")
+            
+            if insights:
+                st.info("### Key Insights:")
+                for insight in insights:
+                    st.write(f"• {insight}")
+            else:
+                st.success("✅ All projects are on track!")
+            
+            # Top recommendations
+            st.markdown("### 🎯 Recommendations:")
+            
+            if overspent_projects:
+                st.write("1. **Immediate Action**: Review overspent projects for budget adjustments")
+            
+            if metrics['at_risk_projects'] > 0:
+                st.write("2. **Priority Focus**: Allocate resources to at-risk projects")
+            
+            if metrics['budget_variance'] < -50:
+                st.write("3. **Budget Review**: Investigate why budget utilization is low")
     
     st.markdown('</div>', unsafe_allow_html=True)
     
