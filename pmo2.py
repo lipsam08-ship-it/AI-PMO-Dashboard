@@ -566,7 +566,7 @@ def get_status_badge(status):
         'Critical': 'status-critical',
         'Completed': 'status-completed'
     }
-    return f'<span class="{status_classes.get(status, 'status-planning')}">{status}</span>'
+    return f"<span class='{status_classes.get(status, 'status-planning')}'>{status}</span>"
 
 def get_status_counts(projects):
     """Count projects by status"""
@@ -1171,3 +1171,4 @@ def show_dashboard_tab():
 # Run the app
 if __name__ == "__main__":
     main()
+
